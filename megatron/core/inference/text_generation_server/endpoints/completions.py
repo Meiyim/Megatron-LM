@@ -113,17 +113,21 @@ class MegatronCompletions(Resource):
             logprobs = local_kwargs["return_output_log_probs"]
             top_n_logprobs = local_kwargs["return_topk_logprobs"]
             random_seed = local_kwargs["random_seed"]
-            response_dict = run_mcore_engine(
-                self.engine,
-                prompts,
-                temperature,
-                top_k,
-                top_p,
-                logprobs,
-                tokens_to_generate,
-                top_n_logprobs=top_n_logprobs,
-                random_seed=random_seed,
-            )
+            try:
+                response_dict = run_mcore_engine(
+                    self.engine,
+                    prompts,
+                    temperature,
+                    top_k,
+                    top_p,
+                    logprobs,
+                    tokens_to_generate,
+                    top_n_logprobs=top_n_logprobs,
+                    random_seed=random_seed,
+                    stop_words=stop_until,
+                )
+            except ValueError as e:
+                return str(e), 400
             result = [
                 response_dict["text"],
                 response_dict["segments"],
