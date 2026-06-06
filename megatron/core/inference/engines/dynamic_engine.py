@@ -556,12 +556,16 @@ class DynamicInferenceEngine(AbstractEngine):
             mp_len_addr = None
 
         # Broadcast addresses to respective ranks.
+        logging.info(f"[rank={torch.distributed.get_rank()}] Before dp broadcast: dp_src={dp_src}, dp_size={get_pg_size(dp_group)}, dp_rank={dp_rank}, dp_addr={dp_addr}")
         bcast = [dp_addr]
         torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
         [dp_addr] = bcast
+        logging.info(f"[rank={torch.distributed.get_rank()}] After dp broadcast: dp_addr={dp_addr}")
+        logging.info(f"[rank={torch.distributed.get_rank()}] Before mp broadcast: mp_src={mp_src}, mp_group_size={get_pg_size(mp_group)}, tp_rank={tp_rank}, pp_rank={pp_rank}, is_mp_coordinator={self.is_mp_coordinator}")
         bcast = [mp_req_addr, mp_len_addr]
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr, mp_len_addr] = bcast
+        logging.info(f"[rank={torch.distributed.get_rank()}] After mp broadcast: mp_req_addr={mp_req_addr}, mp_len_addr={mp_len_addr}")
 
         identity = f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
@@ -600,11 +604,14 @@ class DynamicInferenceEngine(AbstractEngine):
             self.model_parallel_num_msgs_subscriber_socket,
         ]
 
+        logging.info(f"[rank={torch.distributed.get_rank()}] Before mp_group barrier")
         torch.distributed.barrier(mp_group)
+        logging.info(f"[rank={torch.distributed.get_rank()}] After mp_group barrier")
 
         # initialize zmq-based EP communicator
         self.ep_rank = get_pg_rank(self.pg_collection.ep)
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
+        logging.info(f"[rank={torch.distributed.get_rank()}] EP setup: ep_rank={self.ep_rank}, ep_world_size={self.ep_world_size}")
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
@@ -618,15 +625,18 @@ class DynamicInferenceEngine(AbstractEngine):
             )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
+            logging.info(f"[rank={torch.distributed.get_rank()}] Waiting for coordinator ready...")
             await await_process_call(
                 coordinator_ready_event.wait, self.inference_coordinator_process
             )
             logging.info("Inference co-ordinator is ready to receive requests!")
             logging.info(f"Data parallel coordinator can be found at {dp_addr}")
 
+        logging.info(f"[rank={torch.distributed.get_rank()}] Starting engine loop (run_engine_with_coordinator)")
         # Finally run the engine infinite loop.
         loop = get_asyncio_loop(loop)
         self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
+        logging.info(f"[rank={torch.distributed.get_rank()}] Engine loop task created, returning dp_addr={dp_addr}")
 
         return dp_addr
 
@@ -2208,6 +2218,164 @@ class DynamicInferenceEngine(AbstractEngine):
                 await self.async_step()
         except asyncio.CancelledError:
             pass
+
+    @trace_async_exceptions
+    async def run_engine_ep_partitioned(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
+        """Always-stepping EP-partitioned engine loop.
+
+        Each EP rank independently processes its own requests. All ranks step
+        every iteration (real or dummy forward) to participate in MoE all-to-all
+        collectives. No EP consensus needed — synchronization happens naturally
+        at the all-to-all barriers inside the model forward pass.
+        """
+        self._loop = get_asyncio_loop(loop)
+        self.use_coordinator = True
+        try:
+            while True:
+                self.schedule_requests()
+                local_pending = (
+                    self.context.get_active_request_count() + len(self.waiting_request_ids)
+                )
+                if local_pending > 0:
+                    self.schedule_waiting_requests()
+                    logging.info(f"[rank={torch.distributed.get_rank()}] stepping with {local_pending} pending requests")
+                    await self.async_step()
+                else:
+                    self.controller.dummy_forward()
+                    self.context.step_count += 1
+                    await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass
+
+    async def start_listening_to_ep_partitioned_coordinator(
+        self,
+        inference_coordinator_port: int | None = None,
+        launch_inference_coordinator: bool = True,
+        *,
+        hostname: str | None = None,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ):
+        """Setup ZMQ for EP-partitioned mode where each EP rank is an independent DP worker.
+
+        Unlike start_listening_to_data_parallel_coordinator, this skips the EP
+        consensus communicator and launches the always-stepping engine loop.
+        Each EP rank registers with the coordinator as its own DP worker.
+        """
+        assert HAVE_ZMQ, "please install pyzmq: pip install pyzmq"
+        assert HAVE_MSGPACK, "please install msgpack: pip install msgpack"
+
+        self.zmq_context = zmq.Context.instance()
+        self.zmq_sockets = []
+
+        dp_group = self.pg_collection.dp
+        dp_src = get_pg_src_rank(dp_group)
+        dp_size = get_pg_size(self.pg_collection.dp)
+        dp_rank = get_pg_rank(self.pg_collection.dp)
+
+        mp_group = self.pg_collection.mp
+        mp_src = get_pg_src_rank(mp_group)
+        tp_rank = get_pg_rank(self.pg_collection.tp)
+        pp_rank = get_pg_rank(self.pg_collection.pp)
+
+        self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
+        self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
+
+        local_ip = hostname or socket.gethostname()
+
+        if launch_inference_coordinator and self.is_dp_coordinator:
+            spawn_context = multiprocessing.get_context('spawn')
+            deterministic_mode = torch.are_deterministic_algorithms_enabled()
+            dp_pipe, dp_process_pipe = spawn_context.Pipe()
+            coordinator_ready_event = spawn_context.Event()
+            self.inference_coordinator_process = spawn_context.Process(
+                target=DataParallelInferenceCoordinator.entrypoint,
+                kwargs={
+                    "pipe_connection": dp_process_pipe,
+                    "ready_event": coordinator_ready_event,
+                    "data_parallel_size": get_pg_size(self.pg_collection.dp),
+                    "tokenizer": self.controller.tokenizer,
+                    "max_requests": self.context.max_requests,
+                    "inference_coordinator_port": inference_coordinator_port,
+                    "deterministic_mode": deterministic_mode,
+                    "block_size_tokens": self.context.block_size_tokens,
+                    "enable_prefix_caching": self.context.enable_prefix_caching,
+                    "prefix_caching_coordinator_policy": self.context.prefix_caching_coordinator_policy,
+                    "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
+                    "hostname": hostname,
+                },
+            )
+            self.inference_coordinator_process.start()
+            await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
+            dp_addr = dp_pipe.recv()
+            dp_pipe.close()
+        elif not launch_inference_coordinator:
+            dp_addr = f"tcp://{local_ip}:{inference_coordinator_port}"
+        else:
+            dp_addr = None
+
+        # Broadcast coordinator address to all DP ranks
+        bcast = [dp_addr]
+        torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
+        [dp_addr] = bcast
+
+        # MP broadcast (size=1 with TP=1, PP=1, so this is a no-op)
+        if self.is_mp_coordinator:
+            mp_req_sock = self.zmq_context.socket(zmq.PUB)
+            mp_req_sock.bind_to_random_port(f"tcp://{local_ip}")
+            mp_req_addr = mp_req_sock.getsockopt_string(zmq.LAST_ENDPOINT)
+            mp_len_sock = self.zmq_context.socket(zmq.PUB)
+            mp_len_sock.bind_to_random_port(f"tcp://{local_ip}")
+            mp_len_addr = mp_len_sock.getsockopt_string(zmq.LAST_ENDPOINT)
+        else:
+            mp_req_addr = None
+            mp_len_addr = None
+
+        bcast = [mp_req_addr, mp_len_addr]
+        torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
+        [mp_req_addr, mp_len_addr] = bcast
+
+        identity = f'mp-coord-{dp_rank}'
+        if self.is_mp_coordinator:
+            self.socket_for_receiving_requests = self.zmq_context.socket(zmq.DEALER)
+            self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
+            self.socket_for_receiving_requests.connect(dp_addr)
+            self.socket_for_receiving_requests.send(b"")
+            self.model_parallel_publisher_socket = mp_req_sock
+            self.model_parallel_num_msgs_publisher_socket = mp_len_sock
+            self.zmq_sockets += [
+                self.socket_for_receiving_requests,
+                self.model_parallel_num_msgs_publisher_socket,
+                self.model_parallel_publisher_socket,
+            ]
+
+        self.model_parallel_subscriber_socket = self.zmq_context.socket(zmq.SUB)
+        self.model_parallel_subscriber_socket.connect(mp_req_addr)
+        self.model_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        self.model_parallel_num_msgs_subscriber_socket = self.zmq_context.socket(zmq.SUB)
+        self.model_parallel_num_msgs_subscriber_socket.connect(mp_len_addr)
+        self.model_parallel_num_msgs_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        self.zmq_sockets += [
+            self.model_parallel_subscriber_socket,
+            self.model_parallel_num_msgs_subscriber_socket,
+        ]
+
+        torch.distributed.barrier(mp_group)
+
+        # Skip EP ZMQ communicator — no consensus needed in partitioned mode
+        self.ep_rank = get_pg_rank(self.pg_collection.ep)
+        self.ep_world_size = get_pg_size(self.pg_collection.ep)
+
+        if launch_inference_coordinator and self.is_dp_coordinator:
+            await await_process_call(
+                coordinator_ready_event.wait, self.inference_coordinator_process
+            )
+            logging.info("Inference co-ordinator is ready to receive requests!")
+            logging.info(f"Data parallel coordinator can be found at {dp_addr}")
+
+        loop = get_asyncio_loop(loop)
+        self.engine_loop_task = loop.create_task(self.run_engine_ep_partitioned(loop=loop))
+
+        return dp_addr
 
     async def _ep_establish_consensus(
         self, local_work: int, signal_consensus: bool
