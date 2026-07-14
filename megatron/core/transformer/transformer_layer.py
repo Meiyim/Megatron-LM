@@ -1595,7 +1595,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         if CudaGraphScope.attn in self.config.cuda_graph_scope:
             submodules.append(self.self_attention_hyper_connection)
-        # HC layer rejects MoE MLPs in __init__, so only the dense (mlp) scope applies.
+        # HC layer rejects MoE MLPs under CUDA graph in __init__ (the guard-relax admits a
+        # MoE MLP only in the eager, no-mHC-recompute path), so whenever this cuda-graph code
+        # path runs the layer is dense and only the mlp scope applies.
         if CudaGraphScope.mlp in self.config.cuda_graph_scope:
             submodules.append(self.mlp_hyper_connection)
         return submodules
