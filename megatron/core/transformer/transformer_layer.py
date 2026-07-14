@@ -1506,16 +1506,32 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             "Use TransformerLayer instead if hyper connections are not needed."
         )
 
-        # mHC over a single MoE-MLP layer is not supported in this implementation;
-        # compose mHC with MoE by wrapping MoE inside a HyperConnectionHybridLayer
-        # (HybridStack path) instead. This guard fires at setup so misconfigured
-        # specs fail fast rather than producing silently-wrong shapes at runtime.
+        # mHC over a MoE-MLP layer. The mHC mix is sublayer-agnostic: it collapses the
+        # n residual streams to one, runs the sublayer on that single stream, and feeds the
+        # sublayer's `mlp_output_with_bias` through the same n-stream BDA as a dense MLP. So
+        # in EAGER execution with no mHC-recompute, MoE+mHC == dense+mHC (this mirrors dev's
+        # HyperConnectionHybridLayer eager "raw-delta" path). The upstream basic split guarded
+        # MoE off only because MoE additionally needs (a) CUDA-graph "partial capture" (expert
+        # all-to-all is not graph-safe) and (b) the mHC-recompute CheckpointManager — both of
+        # which live in HyperConnectionHybridLayer (HybridStack). Local relaxation for the MAI
+        # GPT ladder (uniform GPT, fused attn, eager, recompute OFF); fail LOUD if either of
+        # those two conditions is on, since this decomposed path does not implement them.
         if self.is_moe_layer:
-            raise NotImplementedError(
-                "HyperConnectionTransformerLayer does not support MoE MLP submodules. "
-                "To combine mHC with MoE, wrap the MoE block as a HybridStack layer "
-                "via HyperConnectionHybridLayer instead."
+            _cuda_graph_on = (
+                getattr(self.config, "cuda_graph_impl", "none") != "none"
+                or getattr(self.config, "enable_cuda_graph", False)
             )
+            _mhc_recompute_on = getattr(self.config, "recompute_granularity", None) == "selective" and (
+                "mhc" in (getattr(self.config, "recompute_modules", None) or [])
+            )
+            if _cuda_graph_on or _mhc_recompute_on:
+                raise NotImplementedError(
+                    "HyperConnectionTransformerLayer supports a MoE MLP submodule only in the "
+                    "eager, no-mHC-recompute path (cuda_graph_impl='none' and 'mhc' not in "
+                    f"recompute_modules); got cuda_graph_on={_cuda_graph_on}, "
+                    f"mhc_recompute_on={_mhc_recompute_on}. Use HyperConnectionHybridLayer "
+                    "(HybridStack) for CUDA-graph capture or mHC-recompute with MoE."
+                )
 
         self.self_attention_hyper_connection = build_module(
             submodules.self_attention_hyper_connection,
