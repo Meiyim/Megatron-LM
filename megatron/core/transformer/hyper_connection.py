@@ -185,7 +185,11 @@ class HyperConnectionModule(MegatronModule):
         nC = x.shape[-1]
         r = x.norm(dim=-1, keepdim=True) / math.sqrt(nC)  # shape: [s, b, 1]
         r = 1.0 / (r + self.norm_eps)  # shape: [s, b, 1]
-        proj = self.mapping_proj(x)  # [s, b, n^2 + 2n]
+        # Upcast the projection weight to the input dtype so the mapping stays in fp32
+        # even when params are stored in bf16/fp16 (compute_mappings feeds fp32 x here).
+        proj = torch.nn.functional.linear(
+            x, self.mapping_proj.weight.to(x.dtype)
+        )  # [s, b, n^2 + 2n]
         return proj, r
 
     @torch.compile
@@ -233,15 +237,24 @@ class HyperConnectionModule(MegatronModule):
             h_pre: [s, b, n] - aggregation weights (sigmoid activated)
             h_post: [s, b, n] - expansion weights (2*sigmoid activated)
             h_res: [s, b, n, n] - residual mixing matrix (doubly stochastic)
+
+        The mappings (RMS-norm scaling, sigmoid gating, Sinkhorn doubly-stochastic
+        projection) are numerically sensitive, so they are always computed AND returned
+        in fp32 — regardless of the hidden/param dtype or any active autocast. The
+        downstream mixing ops (aggregate / apply_h_res / _apply_h_post) do their
+        arithmetic in fp32 and cast the result back to the hidden dtype, so returning
+        fp32 mappings never breaks the bf16/fp16 hidden-state contract.
         """
         s, b, _ = x.shape
-        with torch.cuda.nvtx.range("HyperConnection::projection_and_get_norm"):
-            proj, r = self._projection_and_get_norm(x)
-        with torch.cuda.nvtx.range("HyperConnection::compute_h"):
-            h_pre, h_post, h_res = self._compute_h(proj, r)
-        h_res = SinkhornKnopp.apply(
-            h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations
-        )  # [s, b, n, n]
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            with torch.cuda.nvtx.range("HyperConnection::projection_and_get_norm"):
+                proj, r = self._projection_and_get_norm(x)
+            with torch.cuda.nvtx.range("HyperConnection::compute_h"):
+                h_pre, h_post, h_res = self._compute_h(proj, r)
+            h_res = SinkhornKnopp.apply(
+                h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations
+            )  # [s, b, n, n]
 
         return h_pre, h_post, h_res
 
@@ -274,9 +287,9 @@ class HyperConnectionModule(MegatronModule):
             x_expanded = x.unsqueeze(2)  # [s, b, 1, C]
 
         # h_post^T @ x : [s, b, n, 1] * [s, b, 1, C] -> [s, b, n, C]
-        # Using broadcast multiply instead of einsum
-        result = h_post.unsqueeze(-1) * x_expanded
-        return result.view(s, b, n * C)
+        # h_post is fp32 (see compute_mappings); do the expand in fp32, cast back to x's dtype.
+        result = h_post.float().unsqueeze(-1) * x_expanded.float()
+        return result.view(s, b, n * C).to(x.dtype)
 
     @nvtx_decorator(message="HyperConnection::apply_h_post")
     def apply_h_post(
@@ -349,9 +362,10 @@ class HyperConnectionModule(MegatronModule):
         x_streams = x.view(s, b, self.n, C)
 
         # Weighted sum: [s, b, n, C] * [s, b, n, 1] -> sum over n -> [s, b, C]
-        aggregated = (x_streams * h_pre.unsqueeze(-1)).sum(dim=2)
+        # h_pre is fp32 (see compute_mappings); reduce in fp32, cast back to x's dtype.
+        aggregated = (x_streams.float() * h_pre.float().unsqueeze(-1)).sum(dim=2)
 
-        return aggregated
+        return aggregated.to(x.dtype)
 
     @torch.compile
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:
@@ -374,9 +388,10 @@ class HyperConnectionModule(MegatronModule):
         residual_batched = residual.view(s, b, n, C).view(s * b, n, C)
 
         # Batch matrix multiply: [s*b, n, n] @ [s*b, n, C] -> [s*b, n, C]
-        mixed = torch.bmm(h_res_batched, residual_batched)
+        # h_res is fp32 (see compute_mappings); do the mix in fp32, cast back to residual's dtype.
+        mixed = torch.bmm(h_res_batched.float(), residual_batched.float())
 
-        return mixed.view(s, b, n * C)
+        return mixed.view(s, b, n * C).to(residual.dtype)
 
     def forward(
         self,
