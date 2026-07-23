@@ -1509,28 +1509,33 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # mHC over a MoE-MLP layer. The mHC mix is sublayer-agnostic: it collapses the
         # n residual streams to one, runs the sublayer on that single stream, and feeds the
         # sublayer's `mlp_output_with_bias` through the same n-stream BDA as a dense MLP. So
-        # in EAGER execution with no mHC-recompute, MoE+mHC == dense+mHC (this mirrors dev's
-        # HyperConnectionHybridLayer eager "raw-delta" path). The upstream basic split guarded
-        # MoE off only because MoE additionally needs (a) CUDA-graph "partial capture" (expert
-        # all-to-all is not graph-safe) and (b) the mHC-recompute CheckpointManager — both of
-        # which live in HyperConnectionHybridLayer (HybridStack). Local relaxation for the MAI
-        # GPT ladder (uniform GPT, fused attn, eager, recompute OFF); fail LOUD if either of
-        # those two conditions is on, since this decomposed path does not implement them.
+        # in EAGER execution MoE+mHC == dense+mHC (the "raw-delta" path).
+        #
+        # mHC-recompute IS supported here for MoE in the eager path: the recompute
+        # CheckpointManager only checkpoints the sublayer-agnostic mHC glue ops (n-stream
+        # aggregate, layernorms, fused BDAs) — never the MoE expert forward / token-dispatcher
+        # all-to-all (those are handled independently by MoELayer.moe_layer_recompute, gated on
+        # "moe" in recompute_modules). The block-end unified recompute hook restores every glue
+        # output BEFORE autograd descends into the MoE backward, so the router's saved input
+        # (pre_mlp_layernorm_output) is live in time — same guarantee as dense.
+        # (Caveat: fp8/fp4 MoE + mHC-recompute is allowed by this guard but is currently
+        # untested; the mechanism is precision-agnostic but no parity coverage exists yet.)
+        #
+        # CUDA-graph "partial capture" for MoE (expert all-to-all is not graph-safe; needs a
+        # router/postprocess split not present in this decomposed layer) is NOT implemented,
+        # so fail LOUD if it is requested.
         if self.is_moe_layer:
             _cuda_graph_on = (
                 getattr(self.config, "cuda_graph_impl", "none") != "none"
                 or getattr(self.config, "enable_cuda_graph", False)
             )
-            _mhc_recompute_on = getattr(self.config, "recompute_granularity", None) == "selective" and (
-                "mhc" in (getattr(self.config, "recompute_modules", None) or [])
-            )
-            if _cuda_graph_on or _mhc_recompute_on:
+            if _cuda_graph_on:
                 raise NotImplementedError(
                     "HyperConnectionTransformerLayer supports a MoE MLP submodule only in the "
-                    "eager, no-mHC-recompute path (cuda_graph_impl='none' and 'mhc' not in "
-                    f"recompute_modules); got cuda_graph_on={_cuda_graph_on}, "
-                    f"mhc_recompute_on={_mhc_recompute_on}. Use HyperConnectionHybridLayer "
-                    "(HybridStack) for CUDA-graph capture or mHC-recompute with MoE."
+                    "eager path (cuda_graph_impl='none' and enable_cuda_graph=False); got "
+                    f"cuda_graph_on={_cuda_graph_on}. CUDA-graph capture with a MoE MLP is not "
+                    "implemented for this layer. (mHC-recompute with a MoE MLP is supported in "
+                    "the eager path.)"
                 )
 
         self.self_attention_hyper_connection = build_module(
