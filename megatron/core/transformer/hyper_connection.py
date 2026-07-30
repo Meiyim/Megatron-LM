@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from megatron.core.tensor_parallel.random import is_checkpointing
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
@@ -252,9 +253,24 @@ class HyperConnectionModule(MegatronModule):
                 proj, r = self._projection_and_get_norm(x)
             with torch.cuda.nvtx.range("HyperConnection::compute_h"):
                 h_pre, h_post, h_res = self._compute_h(proj, r)
-            h_res = SinkhornKnopp.apply(
-                h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations
-            )  # [s, b, n, n]
+            h_res_logits = h_res.view(s, b, self.n, self.n)
+            if is_checkpointing():
+                # Under full activation-recompute the layer forward is re-run with
+                # grad enabled, so autograd tapes the 20-iter chain directly.
+                # SinkhornKnopp.apply would add its own recompute pass in backward
+                # on top of that; plain ops give identical values without it.
+                m_init = torch.exp(
+                    h_res_logits - h_res_logits.max(dim=-1, keepdim=True).values
+                )
+                h_res = SinkhornKnopp._sinkhorn_normalize(
+                    m_init, self.sinkhorn_iterations
+                )
+            else:
+                # Other paths keep SinkhornKnopp.apply for its M_init-only
+                # backward memory footprint.
+                h_res = SinkhornKnopp.apply(
+                    h_res_logits, self.sinkhorn_iterations
+                )  # [s, b, n, n]
 
         return h_pre, h_post, h_res
 

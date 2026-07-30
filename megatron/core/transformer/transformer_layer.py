@@ -1511,19 +1511,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # sublayer's `mlp_output_with_bias` through the same n-stream BDA as a dense MLP. So
         # in EAGER execution MoE+mHC == dense+mHC (the "raw-delta" path).
         #
-        # mHC-recompute IS supported here for MoE in the eager path: the recompute
-        # CheckpointManager only checkpoints the sublayer-agnostic mHC glue ops (n-stream
-        # aggregate, layernorms, fused BDAs) — never the MoE expert forward / token-dispatcher
-        # all-to-all (those are handled independently by MoELayer.moe_layer_recompute, gated on
-        # "moe" in recompute_modules). The block-end unified recompute hook restores every glue
-        # output BEFORE autograd descends into the MoE backward, so the router's saved input
-        # (pre_mlp_layernorm_output) is live in time — same guarantee as dense.
-        # (Caveat: fp8/fp4 MoE + mHC-recompute is allowed by this guard but is currently
-        # untested; the mechanism is precision-agnostic but no parity coverage exists yet.)
+        # mHC-recompute is supported for MoE here: it only checkpoints the mHC glue ops,
+        # never the MoE expert forward / token-dispatcher all-to-all (those go through
+        # MoELayer.moe_layer_recompute). fp8/fp4 MoE + mHC-recompute is allowed but untested.
         #
-        # CUDA-graph "partial capture" for MoE (expert all-to-all is not graph-safe; needs a
-        # router/postprocess split not present in this decomposed layer) is NOT implemented,
-        # so fail LOUD if it is requested.
+        # CUDA-graph partial capture is NOT implemented (expert all-to-all is not
+        # graph-safe), so fail LOUD if it is requested.
         if self.is_moe_layer:
             _cuda_graph_on = (
                 getattr(self.config, "cuda_graph_impl", "none") != "none"
