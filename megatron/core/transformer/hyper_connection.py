@@ -127,11 +127,117 @@ if HAVE_TRITON:
         # dL/dH = dL/dM_init * M_init, since M_init = exp(H).
         tl.store(GIN_ptr + idx, g * m_init, mask=m2)
 
+    @triton.jit
+    def _sinkhorn_log_fwd_kernel(
+        H_ptr,
+        OUT_ptr,
+        n_mats,
+        log_eps,
+        BLOCK: tl.constexpr,
+        N: tl.constexpr,
+        T: tl.constexpr,
+    ):
+        """Log-space Sinkhorn: row/column log-softmax via LSE, exp only at the end.
+
+        The direct form (exp first, then divide by sums) underflows to 0 once the
+        logits span more than ~fp32's exponent range, which sends the eps-clamped
+        divide to NaN in the gradient. Working in log-space is unconditionally
+        stable; measured NaN-free where the direct form fails at logit scale >= 80.
+        Accumulates in fp32 and casts back, so bf16/fp16 inputs are accepted.
+        """
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_mats
+        i = tl.arange(0, N)[None, :, None]
+        j = tl.arange(0, N)[None, None, :]
+        idx = offs[:, None, None] * (N * N) + i * N + j
+        m2 = mask[:, None, None]
+
+        lw = tl.load(H_ptr + idx, mask=m2, other=0.0).to(tl.float32)
+        # Row-max shift cancels in the first row LSE but makes the eps clamp compare
+        # the same quantity the eager path clamps.
+        lw = lw - tl.max(lw, axis=2)[:, :, None]
+
+        for _ in tl.static_range(T):
+            rmax = tl.max(lw, axis=2)[:, :, None]
+            rlse = rmax + tl.log(tl.sum(tl.exp(lw - rmax), axis=2)[:, :, None])
+            lw = lw - tl.maximum(rlse, log_eps)
+            cmax = tl.max(lw, axis=1)[:, None, :]
+            clse = cmax + tl.log(tl.sum(tl.exp(lw - cmax), axis=1)[:, None, :])
+            lw = lw - tl.maximum(clse, log_eps)
+
+        tl.store(OUT_ptr + idx, tl.exp(lw).to(OUT_ptr.dtype.element_ty), mask=m2)
+
+    @triton.jit
+    def _sinkhorn_log_bwd_kernel(
+        H_ptr,
+        GOUT_ptr,
+        GIN_ptr,
+        RLSE_ptr,
+        CLSE_ptr,
+        n_mats,
+        log_eps,
+        BLOCK: tl.constexpr,
+        N: tl.constexpr,
+        T: tl.constexpr,
+    ):
+        """Analytic gradient of the log-space forward, in one launch.
+
+        Reverse-mode of a log-softmax is g - softmax * sum(g), so each phase needs
+        exp(lw) at that point. A replay stores the raw LSEs ([n_mats, T, N]) and the
+        reverse sweep walks lw back additively (y = lw + clse, lw = y + rlse), which
+        keeps the scratch at 2*T*N floats instead of the 2*T*N*N a full log-state
+        history would need. A clamped LSE means the phase was a shift by a constant,
+        whose gradient passes through unchanged.
+        """
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_mats
+        i = tl.arange(0, N)[None, :, None]
+        j = tl.arange(0, N)[None, None, :]
+        idx = offs[:, None, None] * (N * N) + i * N + j
+        m2 = mask[:, None, None]
+        kk = tl.arange(0, N)[None, None, :]
+
+        lw = tl.load(H_ptr + idx, mask=m2, other=0.0).to(tl.float32)
+        lw = lw - tl.max(lw, axis=2)[:, :, None]
+
+        for t in tl.static_range(T):
+            sc = offs[:, None, None] * (T * N) + t * N + kk
+            rmax = tl.max(lw, axis=2)[:, :, None]
+            rlse = rmax + tl.log(tl.sum(tl.exp(lw - rmax), axis=2)[:, :, None])
+            tl.store(RLSE_ptr + sc, tl.trans(rlse, 0, 2, 1), mask=m2)
+            lw = lw - tl.maximum(rlse, log_eps)
+            cmax = tl.max(lw, axis=1)[:, None, :]
+            clse = cmax + tl.log(tl.sum(tl.exp(lw - cmax), axis=1)[:, None, :])
+            tl.store(CLSE_ptr + sc, clse, mask=m2)
+            lw = lw - tl.maximum(clse, log_eps)
+
+        # M = exp(lw_T), so dL/dlw_T = dL/dM * M.
+        g = tl.load(GOUT_ptr + idx, mask=m2, other=0.0).to(tl.float32) * tl.exp(lw)
+
+        for k in tl.static_range(T):
+            t = T - 1 - k
+            sc = offs[:, None, None] * (T * N) + t * N + kk
+            rlse = tl.trans(tl.load(RLSE_ptr + sc, mask=m2, other=0.0), 0, 2, 1)
+            clse = tl.load(CLSE_ptr + sc, mask=m2, other=0.0)
+
+            g_col = g - tl.exp(lw) * tl.sum(g, axis=1)[:, None, :]
+            g = tl.where(clse > log_eps, g_col, g)
+            y = lw + tl.maximum(clse, log_eps)
+
+            g_row = g - tl.exp(y) * tl.sum(g, axis=2)[:, :, None]
+            g = tl.where(rlse > log_eps, g_row, g)
+            lw = y + tl.maximum(rlse, log_eps)
+
+        tl.store(GIN_ptr + idx, g.to(GIN_ptr.dtype.element_ty), mask=m2)
+
 
 # Sinkhorn backend, env-selectable so an A/B needs no code edit.
 #   eager   - original per-iteration op chain
 #   compile - same loop under torch.compile
-#   triton  - hand-written fused kernels (fwd + analytic bwd)
+#   triton  - hand-written fused kernels (log-space fwd + analytic bwd). fp64 inputs
+#             fall back to the direct-form kernels, which accumulate in fp64.
 _SINKHORN_IMPL = os.environ.get("MHC_SINKHORN_IMPL", "eager").lower()
 
 # NOTE: cudagraph output buffers are reused across replays, so callers must either
@@ -157,6 +263,65 @@ class SinkhornKnopp(torch.autograd.Function):
 
     # Tiles per Triton program; 64 measured fastest at n=4.
     triton_block = 64
+
+    # dtypes the log-space kernels accept (they accumulate in fp32 internally, so
+    # fp64 must keep the direct-form path to retain double precision).
+    log_dtypes = (torch.float32, torch.bfloat16, torch.float16)
+
+    @staticmethod
+    def _use_log_triton(t: Tensor) -> bool:
+        """Whether the log-space Triton kernels can serve this tensor."""
+        return (
+            _SINKHORN_IMPL == "triton"
+            and HAVE_TRITON
+            and t.is_cuda
+            and t.dtype in SinkhornKnopp.log_dtypes
+        )
+
+    @staticmethod
+    def _sinkhorn_log_triton(H: Tensor, num_iterations: int) -> Tensor:
+        """Log-space forward: H_res_logits -> doubly stochastic M, one launch."""
+        n = H.shape[-1]
+        flat = H.reshape(-1, n, n).contiguous()
+        out = torch.empty_like(flat)
+        block = SinkhornKnopp.triton_block
+        _sinkhorn_log_fwd_kernel[(triton.cdiv(flat.shape[0], block),)](
+            flat,
+            out,
+            flat.shape[0],
+            math.log(SinkhornKnopp.eps),
+            BLOCK=block,
+            N=n,
+            T=num_iterations,
+        )
+        return out.reshape(H.shape)
+
+    @staticmethod
+    def _sinkhorn_log_backward_triton(
+        grad_output: Tensor, H: Tensor, num_iterations: int
+    ) -> Tensor:
+        """Log-space analytic dL/dH_res_logits, one launch."""
+        n = H.shape[-1]
+        h_flat = H.reshape(-1, n, n).contiguous()
+        g_flat = grad_output.reshape(-1, n, n).contiguous()
+        n_mats = h_flat.shape[0]
+        grad_in = torch.empty_like(h_flat)
+        r_lse = torch.empty((n_mats, num_iterations, n), device=h_flat.device, dtype=torch.float32)
+        c_lse = torch.empty((n_mats, num_iterations, n), device=h_flat.device, dtype=torch.float32)
+        block = SinkhornKnopp.triton_block
+        _sinkhorn_log_bwd_kernel[(triton.cdiv(n_mats, block),)](
+            h_flat,
+            g_flat,
+            grad_in,
+            r_lse,
+            c_lse,
+            n_mats,
+            math.log(SinkhornKnopp.eps),
+            BLOCK=block,
+            N=n,
+            T=num_iterations,
+        )
+        return grad_in.reshape(H.shape)
 
     @staticmethod
     def _sinkhorn_normalize(M: Tensor, num_iterations: int) -> Tensor:
@@ -270,6 +435,16 @@ class SinkhornKnopp(torch.autograd.Function):
         Returns:
             H_res: [s, b, n, n] - doubly stochastic matrix
         """
+        ctx.num_iterations = num_iterations
+
+        # Log-space path: never materializes exp(H), so it survives logit ranges
+        # where the direct form underflows to 0 and the eps-clamped divide NaNs.
+        if SinkhornKnopp._use_log_triton(H_res_logits):
+            ctx.log_space = True
+            ctx.save_for_backward(H_res_logits)
+            return SinkhornKnopp._sinkhorn_log_triton(H_res_logits, num_iterations)
+
+        ctx.log_space = False
         # Gradients are computed explicitly in backward via recomputation.
         # Numerical-stability shift: subtract the per-row max before exp to prevent
         # overflow. This row-wise constant is invariant under Sinkhorn-Knopp
@@ -285,7 +460,6 @@ class SinkhornKnopp(torch.autograd.Function):
         M = SinkhornKnopp._sinkhorn_normalize_fwd(M_init, num_iterations)
 
         ctx.save_for_backward(M_init)
-        ctx.num_iterations = num_iterations
         return M
 
     @staticmethod
@@ -296,9 +470,19 @@ class SinkhornKnopp(torch.autograd.Function):
         With MHC_SINKHORN_IMPL=triton this is a single analytic kernel; otherwise the
         forward pass is recomputed with gradient tracking to obtain the gradients.
         """
-        (M_init,) = ctx.saved_tensors
+        (saved,) = ctx.saved_tensors
         num_iterations = ctx.num_iterations
 
+        if ctx.log_space:
+            # `saved` is H_res_logits; the kernel returns dL/dH directly.
+            return (
+                SinkhornKnopp._sinkhorn_log_backward_triton(
+                    grad_output, saved, num_iterations
+                ),
+                None,
+            )
+
+        M_init = saved
         if _SINKHORN_IMPL == "triton":
             grad_input = SinkhornKnopp._sinkhorn_backward_triton(
                 grad_output, M_init, num_iterations
