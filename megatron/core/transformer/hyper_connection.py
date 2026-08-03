@@ -1,14 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
-import os
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-from megatron.core.tensor_parallel.random import is_checkpointing
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
@@ -233,20 +231,10 @@ if HAVE_TRITON:
         tl.store(GIN_ptr + idx, g.to(GIN_ptr.dtype.element_ty), mask=m2)
 
 
-# Sinkhorn backend, env-selectable so an A/B needs no code edit.
-#   eager   - original per-iteration op chain
-#   compile - same loop under torch.compile
-#   triton  - hand-written fused kernels (log-space fwd + analytic bwd). fp64 inputs
-#             fall back to the direct-form kernels, which accumulate in fp64.
-_SINKHORN_IMPL = os.environ.get("MHC_SINKHORN_IMPL", "eager").lower()
-
-# NOTE: cudagraph output buffers are reused across replays, so callers must either
-# consume the result immediately or clone it.
-_sinkhorn_normalize_compiled = torch.compile(
-    lambda M, num_iterations: SinkhornKnopp._sinkhorn_normalize(M, num_iterations),
-    mode="reduce-overhead",
-    dynamic=False,
-)
+# Whether the fused Triton kernels can serve a given tensor. The log-space kernels
+# accumulate in fp32, so fp64 keeps the direct-form kernels to retain double
+# precision; anything else (CPU, no Triton) falls back to the eager loop.
+_LOG_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 
 class SinkhornKnopp(torch.autograd.Function):
@@ -264,19 +252,15 @@ class SinkhornKnopp(torch.autograd.Function):
     # Tiles per Triton program; 64 measured fastest at n=4.
     triton_block = 64
 
-    # dtypes the log-space kernels accept (they accumulate in fp32 internally, so
-    # fp64 must keep the direct-form path to retain double precision).
-    log_dtypes = (torch.float32, torch.bfloat16, torch.float16)
-
     @staticmethod
     def _use_log_triton(t: Tensor) -> bool:
         """Whether the log-space Triton kernels can serve this tensor."""
-        return (
-            _SINKHORN_IMPL == "triton"
-            and HAVE_TRITON
-            and t.is_cuda
-            and t.dtype in SinkhornKnopp.log_dtypes
-        )
+        return HAVE_TRITON and t.is_cuda and t.dtype in _LOG_DTYPES
+
+    @staticmethod
+    def _use_triton(t: Tensor) -> bool:
+        """Whether either family of Triton kernels can serve this tensor."""
+        return HAVE_TRITON and t.is_cuda and t.dtype in _LOG_DTYPES + (torch.float64,)
 
     @staticmethod
     def _sinkhorn_log_triton(H: Tensor, num_iterations: int) -> Tensor:
@@ -372,22 +356,8 @@ class SinkhornKnopp(torch.autograd.Function):
 
     @staticmethod
     def _sinkhorn_normalize_fwd(M: Tensor, num_iterations: int) -> Tensor:
-        """Dispatch the no-grad-needed forward to whichever backend is selected."""
-        if _SINKHORN_IMPL == "triton":
-            return SinkhornKnopp._sinkhorn_normalize_triton(M, num_iterations)
-        if _SINKHORN_IMPL == "compile":
-            return _sinkhorn_normalize_compiled(M, num_iterations)
-        return SinkhornKnopp._sinkhorn_normalize(M, num_iterations)
-
-    @staticmethod
-    def _sinkhorn_normalize_grad(M: Tensor, num_iterations: int) -> Tensor:
-        """Dispatch a tape-building Sinkhorn (the full-RC recompute pass).
-
-        Triton cannot build a tape, so "triton" falls back to the compiled loop here.
-        """
-        if _SINKHORN_IMPL in ("triton", "compile"):
-            return _sinkhorn_normalize_compiled(M, num_iterations)
-        return SinkhornKnopp._sinkhorn_normalize(M, num_iterations)
+        """Direct-form forward for an already-exponentiated M, no autograd graph."""
+        return SinkhornKnopp._sinkhorn_normalize_triton(M, num_iterations)
 
     @staticmethod
     def _sinkhorn_backward_triton(
@@ -467,8 +437,8 @@ class SinkhornKnopp(torch.autograd.Function):
         """
         Backward through Sinkhorn-Knopp iterations.
 
-        With MHC_SINKHORN_IMPL=triton this is a single analytic kernel; otherwise the
-        forward pass is recomputed with gradient tracking to obtain the gradients.
+        A single analytic Triton kernel where Triton can serve the tensor; otherwise
+        the forward pass is recomputed with gradient tracking.
         """
         (saved,) = ctx.saved_tensors
         num_iterations = ctx.num_iterations
@@ -483,20 +453,18 @@ class SinkhornKnopp(torch.autograd.Function):
             )
 
         M_init = saved
-        if _SINKHORN_IMPL == "triton":
-            grad_input = SinkhornKnopp._sinkhorn_backward_triton(
-                grad_output, M_init, num_iterations
-            )
-            if grad_input is not None:
-                return grad_input, None
-            # Triton unavailable for this dtype/device — fall through.
+        grad_input = SinkhornKnopp._sinkhorn_backward_triton(
+            grad_output, M_init, num_iterations
+        )
+        if grad_input is not None:
+            return grad_input, None
+        # Triton unavailable for this dtype/device — recompute under autograd.
 
-        # Recompute forward with autograd enabled
         with torch.enable_grad():
             # Leaf for recomputation
             M_input = M_init.detach().requires_grad_(True)
 
-            M_current = SinkhornKnopp._sinkhorn_normalize_grad(M_input, num_iterations)
+            M_current = SinkhornKnopp._sinkhorn_normalize(M_input, num_iterations)
 
             # Compute dL/dM_input (i.e., dL/dM_init) via autograd
             (grad_M_init,) = torch.autograd.grad(
@@ -656,34 +624,13 @@ class HyperConnectionModule(MegatronModule):
             with torch.cuda.nvtx.range("HyperConnection::compute_h"):
                 h_pre, h_post, h_res = self._compute_h(proj, r)
             h_res_logits = h_res.view(s, b, self.n, self.n)
-            if is_checkpointing() and torch.is_grad_enabled():
-                # Full-RC RECOMPUTE pass: the layer forward is re-run with grad
-                # enabled, so autograd tapes the 20-iter chain directly.
-                # SinkhornKnopp.apply would add its own recompute pass in backward
-                # on top of that; plain ops give identical values without it.
-                # A tape is mandatory here, so this cannot use the Triton kernel.
-                m_init = torch.exp(
-                    h_res_logits - h_res_logits.max(dim=-1, keepdim=True).values
-                )
-                h_res = SinkhornKnopp._sinkhorn_normalize_grad(
-                    m_init, self.sinkhorn_iterations
-                )
-            else:
-                # No-RC, selective RC (CheckpointWithoutOutput does not set the
-                # checkpointing flag), and full-RC's first pass (run under
-                # torch.no_grad) all land here and keep SinkhornKnopp.apply for its
-                # M_init-only backward memory footprint.
-                h_res = SinkhornKnopp.apply(
-                    h_res_logits, self.sinkhorn_iterations
-                )  # [s, b, n, n]
-            # cudagraph-managed buffers (reduce-overhead) are reused on the next
-            # replay, but h_res must survive until this layer's backward. Clone when
-            # the compiled path produced it; the Triton and eager paths return
-            # ordinary allocator tensors and need no copy.
-            if _SINKHORN_IMPL == "compile" or (
-                _SINKHORN_IMPL == "triton" and is_checkpointing() and torch.is_grad_enabled()
-            ):
-                h_res = h_res.clone()
+            # SinkhornKnopp.apply serves every path, including full-RC's recompute
+            # pass: its Triton backward computes the analytic gradient from the saved
+            # input, so nesting it inside an outer recompute costs one extra kernel
+            # rather than a second 20-iteration chain.
+            h_res = SinkhornKnopp.apply(
+                h_res_logits, self.sinkhorn_iterations
+            )  # [s, b, n, n]
 
         return h_pre, h_post, h_res
 
