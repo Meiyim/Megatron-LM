@@ -27,105 +27,6 @@ except ImportError:
 if HAVE_TRITON:
 
     @triton.jit
-    def _sinkhorn_fused_kernel(
-        M_ptr,
-        OUT_ptr,
-        n_mats,
-        num_iterations,
-        eps,
-        BLOCK: tl.constexpr,
-        N: tl.constexpr,
-    ):
-        """Run all Sinkhorn iterations for BLOCK [N, N] matrices in one launch.
-
-        Each program keeps its tiles in registers across iterations, so the chain
-        costs one round-trip to global memory instead of one per normalization.
-        """
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < n_mats
-        i = tl.arange(0, N)[None, :, None]
-        j = tl.arange(0, N)[None, None, :]
-        idx = offs[:, None, None] * (N * N) + i * N + j
-        # other=1.0 keeps masked lanes' sums non-zero so the tail block stays finite.
-        m = tl.load(M_ptr + idx, mask=mask[:, None, None], other=1.0)
-        for _ in range(num_iterations):
-            m = m / tl.maximum(tl.sum(m, axis=2)[:, :, None], eps)  # T_r
-            m = m / tl.maximum(tl.sum(m, axis=1)[:, None, :], eps)  # T_c
-        tl.store(OUT_ptr + idx, m, mask=mask[:, None, None])
-
-    @triton.jit
-    def _sinkhorn_bwd_kernel(
-        M_INIT_ptr,
-        GOUT_ptr,
-        GIN_ptr,
-        RSUM_ptr,
-        CSUM_ptr,
-        n_mats,
-        eps,
-        BLOCK: tl.constexpr,
-        N: tl.constexpr,
-        T: tl.constexpr,
-    ):
-        """Analytic gradient of the Sinkhorn iterations, in one launch.
-
-        Reverse-mode of the two per-iteration normalizations:
-
-            fwd  r = rowsum(M).clamp(eps); A = M/r ; c = colsum(A).clamp(eps); B = A/c
-            rev  g_A = (g   - sum_i(g  *B)) / c
-                 g_M = (g_A - sum_j(g_A*A)) / r
-
-        A forward replay stores each iteration's r_t/c_t in RSUM/CSUM ([n_mats, T, N]) —
-        Triton cannot hold them in a Python list — and the reverse sweep reads them
-        back, reconstructing tiles as A = B*c, M = A*r. Sums are stored RAW so the
-        reverse pass can recover the clamp mask: a clamped sum makes the forward a
-        division by a constant, whose gradient is g/eps with no subtraction term.
-        T is constexpr, so both loops unroll.
-        """
-        pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < n_mats
-        i = tl.arange(0, N)[None, :, None]
-        j = tl.arange(0, N)[None, None, :]
-        idx = offs[:, None, None] * (N * N) + i * N + j
-        m2 = mask[:, None, None]
-        # scratch layout [n_mats, T, N]: offs*T*N + t*N + k
-        kk = tl.arange(0, N)[None, None, :]
-
-        m_init = tl.load(M_INIT_ptr + idx, mask=m2, other=1.0)
-        g = tl.load(GOUT_ptr + idx, mask=m2, other=0.0)
-
-        m = m_init
-        for t in tl.static_range(T):
-            sc = offs[:, None, None] * (T * N) + t * N + kk
-            r_sum = tl.sum(m, axis=2)[:, :, None]
-            tl.store(RSUM_ptr + sc, tl.trans(r_sum, 0, 2, 1), mask=m2)
-            a = m / tl.maximum(r_sum, eps)
-            c_sum = tl.sum(a, axis=1)[:, None, :]
-            tl.store(CSUM_ptr + sc, c_sum, mask=m2)
-            m = a / tl.maximum(c_sum, eps)
-
-        # `m` holds B_{T-1}; each step rebuilds A_t then M_t.
-        for k in tl.static_range(T):
-            t = T - 1 - k
-            sc = offs[:, None, None] * (T * N) + t * N + kk
-            r_sum = tl.trans(tl.load(RSUM_ptr + sc, mask=m2, other=1.0), 0, 2, 1)
-            c_sum = tl.load(CSUM_ptr + sc, mask=m2, other=1.0)
-            r = tl.maximum(r_sum, eps)
-            c = tl.maximum(c_sum, eps)
-
-            b = m
-            a = b * c
-            g_col = (g - tl.sum(g * b, axis=1)[:, None, :]) / c
-            g = tl.where(c_sum > eps, g_col, g / eps)
-            g_row = (g - tl.sum(g * a, axis=2)[:, :, None]) / r
-            g = tl.where(r_sum > eps, g_row, g / eps)
-            m = a * r
-
-        # dL/dH = dL/dM_init * M_init, since M_init = exp(H).
-        tl.store(GIN_ptr + idx, g * m_init, mask=m2)
-
-    @triton.jit
     def _sinkhorn_log_fwd_kernel(
         H_ptr,
         OUT_ptr,
@@ -231,9 +132,8 @@ if HAVE_TRITON:
         tl.store(GIN_ptr + idx, g.to(GIN_ptr.dtype.element_ty), mask=m2)
 
 
-# Whether the fused Triton kernels can serve a given tensor. The log-space kernels
-# accumulate in fp32, so fp64 keeps the direct-form kernels to retain double
-# precision; anything else (CPU, no Triton) falls back to the eager loop.
+# dtypes the log-space Triton kernels serve. They accumulate in fp32 and cast on
+# I/O; anything else (fp64, CPU, no Triton) falls back to the eager loop.
 _LOG_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 
@@ -256,11 +156,6 @@ class SinkhornKnopp(torch.autograd.Function):
     def _use_log_triton(t: Tensor) -> bool:
         """Whether the log-space Triton kernels can serve this tensor."""
         return HAVE_TRITON and t.is_cuda and t.dtype in _LOG_DTYPES
-
-    @staticmethod
-    def _use_triton(t: Tensor) -> bool:
-        """Whether either family of Triton kernels can serve this tensor."""
-        return HAVE_TRITON and t.is_cuda and t.dtype in _LOG_DTYPES + (torch.float64,)
 
     @staticmethod
     def _sinkhorn_log_triton(H: Tensor, num_iterations: int) -> Tensor:
@@ -330,70 +225,6 @@ class SinkhornKnopp(torch.autograd.Function):
         return M
 
     @staticmethod
-    def _sinkhorn_normalize_triton(M: Tensor, num_iterations: int) -> Tensor:
-        """Single-launch _sinkhorn_normalize, WITHOUT an autograd graph.
-
-        Triton kernels are opaque to autograd, so this is valid only where no tape is
-        needed: this Function's forward, or any caller under torch.no_grad(). Callers
-        must check torch.is_grad_enabled() or gradients are silently dropped.
-        """
-        if not (HAVE_TRITON and M.is_cuda and M.dtype == torch.float32):
-            return SinkhornKnopp._sinkhorn_normalize(M, num_iterations)
-        n = M.shape[-1]
-        flat = M.reshape(-1, n, n).contiguous()
-        out = torch.empty_like(flat)
-        block = SinkhornKnopp.triton_block
-        _sinkhorn_fused_kernel[(triton.cdiv(flat.shape[0], block),)](
-            flat,
-            out,
-            flat.shape[0],
-            num_iterations,
-            SinkhornKnopp.eps,
-            BLOCK=block,
-            N=n,
-        )
-        return out.reshape(M.shape)
-
-    @staticmethod
-    def _sinkhorn_normalize_fwd(M: Tensor, num_iterations: int) -> Tensor:
-        """Direct-form forward for an already-exponentiated M, no autograd graph."""
-        return SinkhornKnopp._sinkhorn_normalize_triton(M, num_iterations)
-
-    @staticmethod
-    def _sinkhorn_backward_triton(
-        grad_output: Tensor, M_init: Tensor, num_iterations: int
-    ) -> Optional[Tensor]:
-        """Analytic dL/dH_res_logits in one launch (see _sinkhorn_bwd_kernel).
-
-        The `* M_init` chain rule is already applied. Returns None when Triton is
-        unavailable for this dtype/device, so the caller can fall back.
-        """
-        if not (HAVE_TRITON and M_init.is_cuda and M_init.dtype in (torch.float32, torch.float64)):
-            return None
-        n = M_init.shape[-1]
-        m_flat = M_init.reshape(-1, n, n).contiguous()
-        g_flat = grad_output.reshape(-1, n, n).contiguous()
-        n_mats = m_flat.shape[0]
-        grad_in = torch.empty_like(m_flat)
-        # Per-iteration raw row/column sums; 2 * T * N floats per matrix.
-        r_sums = torch.empty((n_mats, num_iterations, n), device=m_flat.device, dtype=m_flat.dtype)
-        c_sums = torch.empty((n_mats, num_iterations, n), device=m_flat.device, dtype=m_flat.dtype)
-        block = SinkhornKnopp.triton_block
-        _sinkhorn_bwd_kernel[(triton.cdiv(n_mats, block),)](
-            m_flat,
-            g_flat,
-            grad_in,
-            r_sums,
-            c_sums,
-            n_mats,
-            SinkhornKnopp.eps,
-            BLOCK=block,
-            N=n,
-            T=num_iterations,
-        )
-        return grad_in.reshape(M_init.shape)
-
-    @staticmethod
     def forward(ctx, H_res_logits: Tensor, num_iterations: int) -> Tensor:
         """
         Project to doubly stochastic matrix via iterative row/col normalization.
@@ -407,15 +238,16 @@ class SinkhornKnopp(torch.autograd.Function):
         """
         ctx.num_iterations = num_iterations
 
-        # Log-space path: never materializes exp(H), so it survives logit ranges
-        # where the direct form underflows to 0 and the eps-clamped divide NaNs.
+        # Log-space Triton path: never materializes exp(H), so it survives logit
+        # ranges where the direct form underflows to 0 and the eps-clamped divide
+        # NaNs. The kernel returns dL/dH directly, so H itself is what backward needs.
         if SinkhornKnopp._use_log_triton(H_res_logits):
             ctx.log_space = True
             ctx.save_for_backward(H_res_logits)
             return SinkhornKnopp._sinkhorn_log_triton(H_res_logits, num_iterations)
 
+        # Fallback (CPU, or no Triton): eager loop, gradients recomputed in backward.
         ctx.log_space = False
-        # Gradients are computed explicitly in backward via recomputation.
         # Numerical-stability shift: subtract the per-row max before exp to prevent
         # overflow. This row-wise constant is invariant under Sinkhorn-Knopp
         # normalization: the first iteration's row normalization (T_r) divides each
@@ -424,10 +256,7 @@ class SinkhornKnopp(torch.autograd.Function):
         # fixed point and the same gradient. The shift therefore changes only the
         # numeric stability of the exp, not the algorithm's output.
         M_init = torch.exp(H_res_logits - H_res_logits.max(dim=-1, keepdim=True).values)
-
-        # autograd.Function.forward always runs with grad disabled, so no tape is
-        # needed here — the fast no-grad backend is safe.
-        M = SinkhornKnopp._sinkhorn_normalize_fwd(M_init, num_iterations)
+        M = SinkhornKnopp._sinkhorn_normalize(M_init, num_iterations)
 
         ctx.save_for_backward(M_init)
         return M
@@ -437,8 +266,8 @@ class SinkhornKnopp(torch.autograd.Function):
         """
         Backward through Sinkhorn-Knopp iterations.
 
-        A single analytic Triton kernel where Triton can serve the tensor; otherwise
-        the forward pass is recomputed with gradient tracking.
+        A single analytic Triton kernel on the log-space path; otherwise the forward
+        pass is recomputed with gradient tracking.
         """
         (saved,) = ctx.saved_tensors
         num_iterations = ctx.num_iterations
@@ -453,13 +282,6 @@ class SinkhornKnopp(torch.autograd.Function):
             )
 
         M_init = saved
-        grad_input = SinkhornKnopp._sinkhorn_backward_triton(
-            grad_output, M_init, num_iterations
-        )
-        if grad_input is not None:
-            return grad_input, None
-        # Triton unavailable for this dtype/device — recompute under autograd.
-
         with torch.enable_grad():
             # Leaf for recomputation
             M_input = M_init.detach().requires_grad_(True)
