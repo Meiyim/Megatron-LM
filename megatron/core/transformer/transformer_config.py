@@ -151,9 +151,14 @@ class TransformerConfig(ModelParallelConfig):
     """Softmax scale for attention scaling."""
 
     softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
-    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
-       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
+    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html.
+       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and
        and learnable offset."""
+
+    add_post_rope_key_bias: bool = False
+    """Add a learnable per-KV-group bias to keys after RoPE. Combined with a sink
+    (softmax_type != 'vanilla'), this yields a query-dependent implicit LSE gate:
+    o *= sigmoid(lse + <R_i q_i, b_k>/sqrt(d)). Requires a sink to be non-trivial."""
 
     num_query_groups: Optional[int] = field(
         default=None, metadata={"argparse_meta": {"default": 1}}
@@ -1544,6 +1549,13 @@ class TransformerConfig(ModelParallelConfig):
                 )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
+
+        if self.add_post_rope_key_bias and self.softmax_type == "vanilla":
+            raise ValueError(
+                "add_post_rope_key_bias requires a sink (softmax_type in "
+                "{'off-by-one', 'learnable'}); with vanilla softmax the bias is a pure "
+                "logit shift removed by normalization (no-op)."
+            )
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":

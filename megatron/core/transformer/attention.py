@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -36,7 +37,7 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
-from megatron.core.transformer.utils import is_layer_window_attention
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, is_layer_window_attention
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -46,6 +47,7 @@ from megatron.core.utils import (
     is_fa_min_version,
     is_te_min_version,
     is_using_quantization_scales,
+    make_tp_sharded_tensor_for_checkpoint,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -381,6 +383,19 @@ class Attention(MegatronModule, ABC):
             and "core_attn" in self.config.recompute_modules
         )
 
+        # Per-KV-group learnable bias added to keys after RoPE. With a sink
+        # (softmax_type != 'vanilla') this acts as a query-dependent implicit LSE gate.
+        if self.config.add_post_rope_key_bias:
+            self.post_rope_key_bias = torch.nn.Parameter(
+                torch.zeros(
+                    self.num_query_groups_per_partition,
+                    self.hidden_size_per_attention_head,
+                    dtype=self.config.params_dtype,
+                )
+            )
+        else:
+            self.post_rope_key_bias = None
+
         self.offload_qkv_linear = (
             self.config.fine_grained_activation_offloading
             and "qkv_linear" in self.config.offload_modules
@@ -428,6 +443,32 @@ class Attention(MegatronModule, ABC):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
+
+    def sharded_state_dict(
+        self,
+        prefix: str = '',
+        sharded_offsets: Tuple[Tuple[int, int, int], ...] = (),
+        metadata: Optional[dict] = None,
+    ) -> ShardedStateDict:
+        """Sharded state dict, adding TP sharding for the post-RoPE key bias.
+
+        The ``post_rope_key_bias`` parameter has shape ``[num_query_groups_per_partition,
+        head_dim]`` and is sharded along dim 0 (KV-group / head axis) across the TP group;
+        dim 1 (head_dim) is replicated. All other parameters use the default recursion.
+        """
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        if self.post_rope_key_bias is not None:
+            metadata = ensure_metadata_has_dp_cp_group(metadata)
+            bias_key = f'{prefix}post_rope_key_bias'
+            sharded_state_dict[bias_key] = make_tp_sharded_tensor_for_checkpoint(
+                tensor=self.post_rope_key_bias,
+                key=bias_key,
+                tp_axis=0,
+                prepend_offsets=sharded_offsets,
+                tp_group=self.tp_group,
+                dp_cp_group=metadata['dp_cp_group'],
+            )
+        return sharded_state_dict
 
     def _checkpointed_attention_forward(
         self,
@@ -1494,6 +1535,9 @@ class Attention(MegatronModule, ABC):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
+
+        if self.post_rope_key_bias is not None:
+            key = key + self.post_rope_key_bias
 
         # ==================================
         # core attention computation
