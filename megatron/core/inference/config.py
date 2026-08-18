@@ -42,6 +42,55 @@ class MambaInferenceStateConfig:
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels."""
 
+    gdn_conv_states_shape: Optional[Tuple[int]] = None
+    """Gated-delta-net conv state shape per request ``(conv_dim_local_tp, conv_kernel_dim)``.
+    ``None`` when the model has no GDN layers."""
+
+    gdn_recurrent_states_shape: Optional[Tuple[int]] = None
+    """Gated-delta-net recurrent state shape per request
+    ``(num_v_heads_local_tp, key_head_dim, value_head_dim)``. ``None`` when the model has
+    no GDN layers."""
+
+    gdn_conv_states_dtype: Optional[torch.dtype] = None
+    """The dtype to use for the GDN conv state tensor. Defaults to the model dtype."""
+
+    gdn_recurrent_states_dtype: Optional[torch.dtype] = None
+    """The dtype to use for the GDN recurrent state tensor. Defaults to the model dtype."""
+
+    @staticmethod
+    def _build_layer_type_list(decoder) -> Optional[List[str]]:
+        """Return a per-(local)-layer symbol list for a hybrid decoder.
+
+        Mamba hybrid decoders expose ``layer_type_list`` directly. GPT-style decoders
+        (e.g. Ernie with ``experimental_attention_variant='gated_delta_net'``) do not, so
+        we synthesize one by inspecting each layer's mixer: a ``GatedDeltaNet`` (or
+        subclass) mixer maps to ``Symbols.GDN``, everything else to ``Symbols.ATTENTION``.
+        Returns ``None`` if neither a ``layer_type_list`` nor iterable ``layers`` exist.
+        """
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+        layer_type_list = getattr(decoder, "layer_type_list", None)
+        if layer_type_list is not None:
+            return list(layer_type_list)
+
+        layers = getattr(decoder, "layers", None)
+        if layers is None:
+            return None
+
+        try:
+            from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+        except ImportError:
+            GatedDeltaNet = ()
+
+        synthesized = []
+        for layer in layers:
+            mixer = getattr(layer, "self_attention", None)
+            if GatedDeltaNet and isinstance(mixer, GatedDeltaNet):
+                synthesized.append(Symbols.GDN)
+            else:
+                synthesized.append(Symbols.ATTENTION)
+        return synthesized
+
     @classmethod
     def from_model(
         cls,
@@ -49,33 +98,60 @@ class MambaInferenceStateConfig:
         conv_states_dtype: Optional[torch.dtype] = None,
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
-        """Returns Mamba inference state config from the model if it is a hybrid model."""
+        """Returns Mamba/GDN inference state config from the model if it is a hybrid model."""
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         decoder = get_attr_wrapped_model(model, "decoder")
-        layer_type_list = getattr(decoder, "layer_type_list", None)
-        if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        layer_type_list = cls._build_layer_type_list(decoder)
+        if layer_type_list is None:
+            return None
+
+        has_mamba = Symbols.MAMBA in layer_type_list
+        has_gdn = Symbols.GDN in layer_type_list
+        if not (has_mamba or has_gdn):
+            return None
+
+        if conv_states_dtype is None:
+            conv_states_dtype = model.config.params_dtype
+        if ssm_states_dtype is None:
+            ssm_states_dtype = model.config.params_dtype
+
+        # Mamba state shapes (only if the model actually has Mamba layers).
+        mamba_conv_states_shape = None
+        mamba_ssm_states_shape = None
+        mamba_chunk_size = 128
+        if has_mamba:
             (mamba_conv_states_shape, mamba_ssm_states_shape) = (
                 decoder.mamba_state_shapes_per_request()
             )
-            if conv_states_dtype is None:
-                conv_states_dtype = model.config.params_dtype
-            if ssm_states_dtype is None:
-                ssm_states_dtype = model.config.params_dtype
-            mamba_chunk_size = 128
-            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
+            for layer_type, layer in zip(layer_type_list, decoder.layers):
                 if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
                     mamba_chunk_size = layer.mixer.chunk_size
                     break
-            return cls(
-                layer_type_list=layer_type_list,
-                conv_states_shape=mamba_conv_states_shape,
-                ssm_states_shape=mamba_ssm_states_shape,
-                conv_states_dtype=conv_states_dtype,
-                ssm_states_dtype=ssm_states_dtype,
-                mamba_chunk_size=mamba_chunk_size,
-            )
-        return None
+
+        # GDN state shapes (only if the model actually has GDN layers).
+        gdn_conv_states_shape = None
+        gdn_recurrent_states_shape = None
+        if has_gdn:
+            for layer_type, layer in zip(layer_type_list, decoder.layers):
+                if layer_type == Symbols.GDN:
+                    (gdn_conv_states_shape, gdn_recurrent_states_shape) = layer.self_attention.gdn_state_shapes_per_request()
+                    break
+
+        return cls(
+            layer_type_list=layer_type_list,
+            conv_states_shape=mamba_conv_states_shape,
+            ssm_states_shape=mamba_ssm_states_shape,
+            conv_states_dtype=conv_states_dtype,
+            ssm_states_dtype=ssm_states_dtype,
+            mamba_chunk_size=mamba_chunk_size,
+            gdn_conv_states_shape=gdn_conv_states_shape,
+            gdn_recurrent_states_shape=gdn_recurrent_states_shape,
+            # Conv state rides at model dtype; the recurrent (K×V) state is kept in fp32
+            # for decode precision (it is tiny per request and accumulated step by step).
+            gdn_conv_states_dtype=conv_states_dtype,
+            gdn_recurrent_states_dtype=torch.float32,
+        )
 
 
 class PrefixCachingEvictionPolicy(str, Enum):

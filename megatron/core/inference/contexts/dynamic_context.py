@@ -349,6 +349,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
 
+            # GDN (gated-delta-net) recurrent-layer state. GDN reuses the same hybrid
+            # metadata + per-request slots as Mamba, but keeps its own conv/recurrent
+            # state buffers. Shapes are None when the model has no GDN layers.
+            self.gdn_conv_states_shape = mamba_inference_state_config.gdn_conv_states_shape
+            self.gdn_recurrent_states_shape = mamba_inference_state_config.gdn_recurrent_states_shape
+            self.gdn_conv_states_dtype = mamba_inference_state_config.gdn_conv_states_dtype
+            self.gdn_recurrent_states_dtype = (
+                mamba_inference_state_config.gdn_recurrent_states_dtype
+            )
+
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
             # layer type.
@@ -358,12 +368,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
             )
 
-            if len(gdn_layer_map) > 0:
-                raise NotImplementedError("GDN layers are not supported for inference.")
-
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
-            self.layer_map = attention_layer_map | dsa_layer_map | mamba_layer_map
+            self.num_gdn_layers = len(gdn_layer_map)
+            # GDN slots share the same per-request row index as Mamba; the merged map
+            # returns whichever type-local index matches the layer's own cache buffers.
+            self.layer_map = (
+                attention_layer_map | dsa_layer_map | mamba_layer_map | gdn_layer_map
+            )
         else:
             # The layer map is the identity function for pure Transformer models.
             # Use the same per-PP-rank layer count as TransformerBlock (handles
@@ -386,7 +398,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 model_config, vp_stage=None, pp_rank=pp_rank
             )
             self.num_mamba_layers = 0
+            self.num_gdn_layers = 0
             (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
+            (self.gdn_conv_states_shape, self.gdn_recurrent_states_shape) = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
         if self.num_attention_layers == 0:
@@ -419,22 +433,35 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
-            mamba_states_memory_per_request += (
-                math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
-            )
-            mamba_states_memory_per_request += (
-                math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
-            )
-            mamba_states_memory_per_request *= self.num_mamba_layers
-            if self.num_speculative_tokens > 0:
-                # Add memory for intermediate conv and SSM states
-                intermediate_memory_per_request = (
+            if self.mamba_conv_states_shape is not None:
+                mamba_states_memory_per_request += (
                     math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
-                    + math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
                 )
-                intermediate_memory_per_request *= self.num_mamba_layers
-                intermediate_memory_per_request *= self.num_speculative_tokens + 1
-                mamba_states_memory_per_request += intermediate_memory_per_request
+                mamba_states_memory_per_request += (
+                    math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
+                )
+                mamba_states_memory_per_request *= self.num_mamba_layers
+                if self.num_speculative_tokens > 0:
+                    # Add memory for intermediate conv and SSM states
+                    intermediate_memory_per_request = (
+                        math.prod(self.mamba_conv_states_shape)
+                        * self.mamba_conv_states_dtype.itemsize
+                        + math.prod(self.mamba_ssm_states_shape)
+                        * self.mamba_ssm_states_dtype.itemsize
+                    )
+                    intermediate_memory_per_request *= self.num_mamba_layers
+                    intermediate_memory_per_request *= self.num_speculative_tokens + 1
+                    mamba_states_memory_per_request += intermediate_memory_per_request
+            if self.gdn_conv_states_shape is not None:
+                # GDN reuses the Mamba per-request memory pool (no intermediate/offload
+                # buffers in the MVP: no speculative decode, no offload).
+                gdn_states_memory_per_request = (
+                    math.prod(self.gdn_conv_states_shape) * self.gdn_conv_states_dtype.itemsize
+                    + math.prod(self.gdn_recurrent_states_shape)
+                    * self.gdn_recurrent_states_dtype.itemsize
+                )
+                gdn_states_memory_per_request *= self.num_gdn_layers
+                mamba_states_memory_per_request += gdn_states_memory_per_request
 
         # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
@@ -735,26 +762,51 @@ class DynamicInferenceContext(BaseInferenceContext):
         ]
 
         if self.is_hybrid_model:
-            mamba_conv_bytes = (
-                math.prod(self.mamba_conv_states_shape)
-                * self.mamba_conv_states_dtype.itemsize
-                * self.num_mamba_layers
-            )
-            mamba_ssm_bytes = (
-                math.prod(self.mamba_ssm_states_shape)
-                * self.mamba_ssm_states_dtype.itemsize
-                * self.num_mamba_layers
-            )
-            mamba_bytes_per_req = mamba_conv_bytes + mamba_ssm_bytes
-            mamba_total_bytes = mamba_bytes_per_req * self.max_requests
-            log_lines += [
-                f"  Mamba states:",
-                f"    num_mamba_layers:      {self.num_mamba_layers}",
-                f"    conv_state_shape:      {self.mamba_conv_states_shape}",
-                f"    ssm_state_shape:       {self.mamba_ssm_states_shape}",
-                f"    per_request:           {get_mem_size_str(mamba_bytes_per_req)}",
-                f"    total ({self.max_requests} requests):  {get_mem_size_str(mamba_total_bytes)}",
-            ]
+            if self.mamba_conv_states_shape is not None:
+                mamba_conv_bytes = (
+                    math.prod(self.mamba_conv_states_shape)
+                    * self.mamba_conv_states_dtype.itemsize
+                    * self.num_mamba_layers
+                )
+                mamba_ssm_bytes = (
+                    math.prod(self.mamba_ssm_states_shape)
+                    * self.mamba_ssm_states_dtype.itemsize
+                    * self.num_mamba_layers
+                )
+                mamba_bytes_per_req = mamba_conv_bytes + mamba_ssm_bytes
+                mamba_total_bytes = mamba_bytes_per_req * self.max_requests
+                log_lines += [
+                    f"  Mamba states:",
+                    f"    num_mamba_layers:      {self.num_mamba_layers}",
+                    f"    conv_state_shape:      {self.mamba_conv_states_shape}",
+                    f"    ssm_state_shape:       {self.mamba_ssm_states_shape}",
+                    f"    per_request:           {get_mem_size_str(mamba_bytes_per_req)}",
+                    f"    total ({self.max_requests} requests):  {get_mem_size_str(mamba_total_bytes)}",
+                ]
+            else:
+                mamba_bytes_per_req = 0
+
+            if self.gdn_conv_states_shape is not None:
+                gdn_conv_bytes = (
+                    math.prod(self.gdn_conv_states_shape)
+                    * self.gdn_conv_states_dtype.itemsize
+                    * self.num_gdn_layers
+                )
+                gdn_rec_bytes = (
+                    math.prod(self.gdn_recurrent_states_shape)
+                    * self.gdn_recurrent_states_dtype.itemsize
+                    * self.num_gdn_layers
+                )
+                gdn_bytes_per_req = gdn_conv_bytes + gdn_rec_bytes
+                gdn_total_bytes = gdn_bytes_per_req * self.max_requests
+                log_lines += [
+                    f"  GDN states:",
+                    f"    num_gdn_layers:        {self.num_gdn_layers}",
+                    f"    conv_state_shape:      {self.gdn_conv_states_shape}",
+                    f"    recurrent_state_shape: {self.gdn_recurrent_states_shape}",
+                    f"    per_request:           {get_mem_size_str(gdn_bytes_per_req)}",
+                    f"    total ({self.max_requests} requests):  {get_mem_size_str(gdn_total_bytes)}",
+                ]
 
             if self.num_speculative_tokens > 0:
                 spec_multiplier = self.num_speculative_tokens + 1
@@ -835,11 +887,17 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _allocate_mamba_states(self):
         """Allocate Mamba states for hybrid models."""
         if self.is_hybrid_model:
+            # d_conv sizes the metadata conv-varlen buffers. Use the Mamba conv width
+            # when present, else fall back to the GDN conv kernel width (pure-GDN model).
+            if self.mamba_conv_states_shape is not None:
+                d_conv = self.mamba_conv_states_shape[-1]
+            else:
+                d_conv = self.gdn_conv_states_shape[-1]
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 mamba_chunk_size=self.mamba_chunk_size,
-                d_conv=self.mamba_conv_states_shape[-1],
+                d_conv=d_conv,
             )
             # Bind the unified CPU/GPU buffers so the per-step Mamba metadata
             # fields ride along with the single coalesced H2D in
@@ -858,16 +916,35 @@ class DynamicInferenceContext(BaseInferenceContext):
                 }
             )
             self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
-            self.mamba_conv_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
-                dtype=self.mamba_conv_states_dtype,
-                device=torch.cuda.current_device(),
-            )
-            self.mamba_ssm_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
-                dtype=self.mamba_ssm_states_dtype,
-                device=torch.cuda.current_device(),
-            )
+            if self.mamba_conv_states_shape is not None:
+                self.mamba_conv_states = torch.empty(
+                    (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
+                    dtype=self.mamba_conv_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
+                self.mamba_ssm_states = torch.empty(
+                    (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
+                    dtype=self.mamba_ssm_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            else:
+                self.mamba_conv_states = None
+                self.mamba_ssm_states = None
+            # GDN recurrent-layer states (MVP: no intermediate/offload buffers).
+            if self.gdn_conv_states_shape is not None:
+                self.gdn_conv_states = torch.empty(
+                    (self.num_gdn_layers, self.max_requests) + self.gdn_conv_states_shape,
+                    dtype=self.gdn_conv_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
+                self.gdn_recurrent_states = torch.empty(
+                    (self.num_gdn_layers, self.max_requests) + self.gdn_recurrent_states_shape,
+                    dtype=self.gdn_recurrent_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            else:
+                self.gdn_conv_states = None
+                self.gdn_recurrent_states = None
             if self.num_speculative_tokens > 0:
                 self.mamba_intermediate_conv_states = torch.empty(
                     (
@@ -1637,6 +1714,22 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return (conv_state, ssm_state)
 
+    def gdn_states_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
+        """Returns the GDN (gated-delta-net) state tensors for the given layer.
+
+        Analog of :meth:`mamba_states_cache`. ``layer_number`` is the model-global
+        (1-indexed) layer number minus the PP offset; ``self.layer_map`` maps it to the
+        GDN-local buffer index. Returns ``(conv_state, recurrent_state)`` views of shape
+        ``[max_requests, *conv_shape]`` / ``[max_requests, *recurrent_shape]``; the mixer
+        gathers/scatters the active per-request slots.
+        """
+        assert self.is_hybrid_model, "Only hybrid models have GDN state tensors"
+        assert self.gdn_conv_states is not None, "Model has no GDN layers"
+        gdn_layer_number = self.layer_map[layer_number - 1]
+        conv_state = self.gdn_conv_states[gdn_layer_number]
+        recurrent_state = self.gdn_recurrent_states[gdn_layer_number]
+        return (conv_state, recurrent_state)
+
     # =========================================================================
     # Mamba prefix cache infrastructure
     # =========================================================================
@@ -2400,12 +2493,22 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._pending_mamba_zeros.append(mamba_idx)
         self._pending_mamba_restores.clear()
 
-        # Batch-zero newly allocated Mamba slots.
+        # Batch-zero newly allocated Mamba / GDN slots. Both share the same
+        # per-request slot index, so a single index tensor zeros both families.
         if self._pending_mamba_zeros:
-            device = self.mamba_conv_states.device
+            ref = (
+                self.mamba_conv_states
+                if self.mamba_conv_states is not None
+                else self.gdn_conv_states
+            )
+            device = ref.device
             indices = torch.tensor(self._pending_mamba_zeros, dtype=torch.long, device=device)
-            self.mamba_conv_states[:, indices] = 0.0
-            self.mamba_ssm_states[:, indices] = 0.0
+            if self.mamba_conv_states is not None:
+                self.mamba_conv_states[:, indices] = 0.0
+                self.mamba_ssm_states[:, indices] = 0.0
+            if self.gdn_conv_states is not None:
+                self.gdn_conv_states[:, indices] = 0.0
+                self.gdn_recurrent_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
     def transfer_bookkeeping_to_gpu(self) -> None:
