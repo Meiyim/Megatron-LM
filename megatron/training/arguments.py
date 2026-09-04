@@ -2386,6 +2386,54 @@ def _add_regularization_args(parser):
                        choices=['adam', 'lion'],
                        help='Optimizer for scalar parameters (embeddings, biases, norms) '
                        'when using muon. Defaults to adam.')
+    group.add_argument('--spectral-ball-momentum', type=float, default=0.9,
+                       help='Momentum for the SpectralBall/MuonBall internal SGD')
+    group.add_argument('--spectral-ball-no-nesterov', dest='spectral_ball_nesterov',
+                       action='store_false', default=True,
+                       help='Disable Nesterov momentum in SpectralBall/MuonBall')
+    group.add_argument('--spectral-ball-power-iteration-steps', type=int, default=20,
+                       help='Power iteration steps used to estimate the leading '
+                       'singular triplet of W')
+    group.add_argument('--spectral-ball-msign-steps', type=int, default=8,
+                       help='Newton-Schulz steps used by msign')
+    group.add_argument('--spectral-ball-msign-dtype', type=str, default='fp32',
+                       choices=['fp32', 'bf16'],
+                       help='Working dtype for the Newton-Schulz iteration in msign. '
+                       'fp32 is the safe default; bf16 is faster but distorts the '
+                       'update direction and can destabilize training.')
+    group.add_argument('--spectral-ball-solver', type=str, default='bisection',
+                       choices=['bisection'],
+                       help='Solver for the Lagrange multiplier lambda')
+    group.add_argument('--spectral-ball-solver-tolerance-f', type=float, default=1e-8,
+                       help='Absolute tolerance on the lambda solve residual')
+    group.add_argument('--spectral-ball-solver-max-iterations', type=int, default=20,
+                       help='Max bisection iterations; each one costs a full msign')
+    group.add_argument('--spectral-ball-radius-mode', type=str, default='spectral_mup',
+                       choices=['spectral_mup', 'identity', 'initialize'],
+                       help='Target spectral radius mode')
+    group.add_argument('--spectral-ball-radius-scaler', type=float, default=1.0,
+                       help='Multiplier applied to the target spectral radius')
+    group.add_argument('--spectral-ball-scale-mode', type=str, default='align_adamw_rms',
+                       choices=['align_adamw_rms', 'spectral_mup', 'shape_scaling'],
+                       help='Update scale mode for SpectralBall/MuonBall')
+    group.add_argument('--spectral-ball-retract-mode', type=str, default='hard',
+                       choices=['hard', 'dynamic'],
+                       help='Retraction mode onto the spectral sphere')
+    group.add_argument('--spectral-ball-retract-alpha', type=float, default=0.05,
+                       help='Step size for dynamic retraction')
+    group.add_argument('--spectral-ball-no-split-qkv', dest='spectral_ball_split_qkv',
+                       action='store_false', default=True,
+                       help='Solve fused QKV as one matrix instead of per component')
+    group.add_argument('--spectral-ball-qkv-split-mode', type=str, default='component',
+                       choices=['component', 'group', 'head'],
+                       help='QKV split granularity')
+    group.add_argument('--spectral-ball-no-split-fc1', dest='spectral_ball_split_fc1',
+                       action='store_false', default=True,
+                       help='Solve gated FC1 as one matrix instead of gate/up')
+    group.add_argument('--spectral-ball-no-split-moe-experts',
+                       dest='spectral_ball_split_moe_experts',
+                       action='store_false', default=True,
+                       help='Solve GroupedMLP expert weights as one matrix')
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')
@@ -2614,7 +2662,8 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap',
+                                'adaptive_muon', 'spectral_ball', 'muon_ball'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')

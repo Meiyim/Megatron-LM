@@ -315,6 +315,60 @@ class OptimizerConfig:
     adaptive_muon_eps: float = 1e-8
     """The eps parameter for the Adaptive Muon optimizer."""
 
+    # Spectral ball / SSO.
+    spectral_ball_momentum: float = 0.9
+    """The momentum used by the internal SGD in SpectralBall/MuonBall."""
+
+    spectral_ball_nesterov: bool = True
+    """Whether to use Nesterov-style momentum in the internal SGD."""
+
+    spectral_ball_power_iteration_steps: int = 20
+    """Number of power iterations used to estimate the leading singular triplet of W."""
+
+    spectral_ball_msign_steps: int = 8
+    """Number of Newton-Schulz steps used by ``msign``."""
+
+    spectral_ball_msign_dtype: str = "fp32"
+    """Working dtype of the Newton-Schulz iteration in ``msign`` ("fp32" or "bf16").
+    fp32 is the documented-safe default: the iteration is rounding-sensitive and bf16
+    distorts the update direction. "bf16" reproduces the upstream SSO tip's numerics."""
+
+    spectral_ball_solver: str = "bisection"
+    """Solver used to find the Lagrange multiplier lambda. Only "bisection" is implemented."""
+
+    spectral_ball_solver_tolerance_f: float = 1e-8
+    """Absolute tolerance on |<Theta, msign(M + lambda*Theta)>| for the lambda solve."""
+
+    spectral_ball_solver_max_iterations: int = 20
+    """Max bisection iterations. Each iteration costs one full ``msign``."""
+
+    spectral_ball_radius_mode: str = "spectral_mup"
+    """Target spectral radius mode. One of "spectral_mup", "identity", "initialize"."""
+
+    spectral_ball_radius_scaler: float = 1.0
+    """Multiplier applied to the target spectral radius."""
+
+    spectral_ball_scale_mode: str = "align_adamw_rms"
+    """Update scale mode. One of "align_adamw_rms", "spectral_mup", "shape_scaling"."""
+
+    spectral_ball_retract_mode: str = "hard"
+    """Retraction mode. "hard" rescales W to the sphere; "dynamic" nudges it by retract_alpha*lr."""
+
+    spectral_ball_retract_alpha: float = 0.05
+    """Step size for dynamic retraction."""
+
+    spectral_ball_split_qkv: bool = True
+    """Whether to solve fused QKV weights per component instead of as one matrix."""
+
+    spectral_ball_qkv_split_mode: str = "component"
+    """QKV split granularity. One of "component", "group", "head"."""
+
+    spectral_ball_split_fc1: bool = True
+    """Whether to split gated FC1 weights into gate/up before solving."""
+
+    spectral_ball_split_moe_experts: bool = True
+    """Whether to solve GroupedMLP expert weights per local expert."""
+
     #######################
     # Distributed optimizer
     #######################
