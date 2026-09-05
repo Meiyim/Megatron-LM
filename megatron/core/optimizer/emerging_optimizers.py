@@ -420,38 +420,35 @@ def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     return kwargs
 
 
-def _get_fc1_split_shapes(model_cfg) -> list[int] | None:
-    """Return [gate_dim, up_dim] for a gated FC1, or None when not gated."""
-    if not getattr(model_cfg, 'gated_linear_unit', False):
-        return None
-    ffn_hidden_size = model_cfg.ffn_hidden_size
-    return [ffn_hidden_size, ffn_hidden_size]
-
-
 def _tag_spectral_ball_params(model_chunks) -> None:
     """Tag params with the attributes SpectralBall/MuonBall read in ``orthogonalize``.
 
     ``_get_megatron_emerging_optimizer`` already tags ``expert_tp`` / ``is_qkv``;
-    the spectral-ball path additionally needs FC1 and GroupedMLP expert metadata,
-    plus ``param_name`` for its retract-bias logging.
+    the spectral-ball path additionally needs per-param FC1 split shapes plus
+    ``param_name`` for its retract-bias logging.
+
+    FC1 shapes are tagged **per parameter** rather than taken from a single model-wide
+    value: in a latent-MoE model the dense FC1 is sized by ``ffn_hidden_size`` while the
+    expert FC1s are sized by ``moe_ffn_hidden_size``, so one global
+    ``fc1_split_shapes`` would assert on whichever family it does not match. For a
+    gated FC1 the gate/up split is always an even halving of dim 0, so derive it
+    from the parameter's own shape.
     """
     for model_chunk in model_chunks:
         cfg = model_chunk.config
+        gated = getattr(cfg, 'gated_linear_unit', False)
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
             param.param_name = name
-            if 'linear_fc1.weight' in name and len(param.shape) == 2:
-                param.is_fc1 = True
-            if 'experts.weight1' in name or 'experts.weight2' in name:
-                num_moe_experts = getattr(cfg, 'num_moe_experts', None)
-                if num_moe_experts:
-                    param.is_grouped_moe = True
-                    param.num_local_experts = (
-                        num_moe_experts // cfg.expert_model_parallel_size
-                    )
-                    param.moe_ffn_hidden_size = cfg.moe_ffn_hidden_size
-                    param.is_gated = cfg.gated_linear_unit
+            # TE GroupedLinear names per-expert weights linear_fc1.weight0..weightN,
+            # so this also covers MoE experts; each is already a single 2D matrix.
+            if gated and 'linear_fc1.weight' in name and param.dim() == 2:
+                out_dim = param.shape[0]
+                if out_dim % 2 == 0:
+                    param.is_fc1 = True
+                    half = out_dim // 2
+                    param.fc1_split_shapes = (half, half)
 
 
 def _spectral_ball_param_overrides() -> Dict[ParamKey, Dict[str, Any]]:
@@ -493,8 +490,12 @@ def _spectral_ball_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
     kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_cfg)
     kwargs["is_fc1_fn"] = lambda p: getattr(p, "is_fc1", False)
-    kwargs["fc1_split_shapes"] = _get_fc1_split_shapes(model_cfg)
-    kwargs["is_grouped_moe_fn"] = lambda p: getattr(p, "is_grouped_moe", False)
+    # Shapes are read per-param (see _tag_spectral_ball_params); no model-wide default.
+    kwargs["fc1_split_shapes"] = None
+    # GroupedMLP fused weight1/weight2 do not exist at this HEAD: TE GroupedLinear
+    # exposes one 2D matrix per expert, so there is nothing extra to split.
+    kwargs["is_grouped_moe_fn"] = lambda p: False
+    kwargs["split_moe_experts"] = False
     kwargs["pg_collection"] = pg_collection
     # Only "duplicated" is implemented: the solve runs on the full gathered matrix.
     kwargs["tp_mode"] = "duplicated"

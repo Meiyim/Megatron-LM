@@ -485,18 +485,27 @@ class MuonBall(OrthogonalizedOptimizer):
 
         # QKV splitting path
         if self.split_qkv and self.is_qkv_fn is not None and self.is_qkv_fn(p):
-            assert self.qkv_split_shapes is not None, "qkv_split_shapes must be provided when split_qkv=True"
+            # Per-param shapes win: attention_output_gate adds a 4th (gate) component,
+            # which the wrapper tags on the param itself.
+            qkv_split_shapes = getattr(p, "qkv_split_shapes", None) or self.qkv_split_shapes
+            assert qkv_split_shapes is not None, "qkv_split_shapes must be provided when split_qkv=True"
             out_dim, in_dim = p.shape
-            split_sum = sum(self.qkv_split_shapes)
+            split_sum = sum(qkv_split_shapes)
             assert (
                 out_dim % split_sum == 0
-            ), f"QKV split shapes {self.qkv_split_shapes} do not divide output dim {out_dim}"
+            ), f"QKV split shapes {qkv_split_shapes} do not divide output dim {out_dim}"
             num_groups = out_dim // split_sum
             param_name = getattr(p, 'param_name', None)
             component_names = ['q', 'k', 'v']
 
             # Compute heads_per_group from qkv_split_shapes
-            q_dim_per_group, kv_channels, _ = self.qkv_split_shapes  # v_dim not used (same as k_dim/kv_channels)
+            q_dim_per_group, kv_channels = qkv_split_shapes[0], qkv_split_shapes[-1]
+            if self.qkv_split_mode in ("group", "head") and len(qkv_split_shapes) != 3:
+                raise NotImplementedError(
+                    f"qkv_split_mode={self.qkv_split_mode!r} assumes 3 (q,k,v) components, "
+                    f"got {len(qkv_split_shapes)} (e.g. attention_output_gate adds a 4th). "
+                    "Use qkv_split_mode='component'."
+                )  # v_dim not used (same as k_dim/kv_channels)
             heads_per_group = q_dim_per_group // kv_channels
 
             # reshape: [num_groups, split_sum, in_dim]
@@ -508,8 +517,8 @@ class MuonBall(OrthogonalizedOptimizer):
                 group_updates = []
                 for g in range(num_groups):
                     # Split this group into Q/K/V: each is [component_dim, in_dim]
-                    Wg_comps = torch.split(W_view[g], list(self.qkv_split_shapes), dim=0)
-                    Mg_comps = torch.split(M_view[g], list(self.qkv_split_shapes), dim=0)
+                    Wg_comps = torch.split(W_view[g], list(qkv_split_shapes), dim=0)
+                    Mg_comps = torch.split(M_view[g], list(qkv_split_shapes), dim=0)
 
                     comp_updates = []
                     for idx, (Wi, Mi) in enumerate(zip(Wg_comps, Mg_comps)):
@@ -530,8 +539,8 @@ class MuonBall(OrthogonalizedOptimizer):
                 group_updates = []
                 for g in range(num_groups):
                     # Split this group into Q/K/V
-                    Wg_comps = torch.split(W_view[g], list(self.qkv_split_shapes), dim=0)
-                    Mg_comps = torch.split(M_view[g], list(self.qkv_split_shapes), dim=0)
+                    Wg_comps = torch.split(W_view[g], list(qkv_split_shapes), dim=0)
+                    Mg_comps = torch.split(M_view[g], list(qkv_split_shapes), dim=0)
 
                     W_q, W_k, W_v = Wg_comps
                     M_q, M_k, M_v = Mg_comps
@@ -568,33 +577,38 @@ class MuonBall(OrthogonalizedOptimizer):
 
             else:  # component mode (original logic)
                 # Component mode: merge all groups' Q together, all K together, all V together
-                W_q, W_k, W_v = torch.split(W_view, list(self.qkv_split_shapes), dim=1)
-                M_q, M_k, M_v = torch.split(M_view, list(self.qkv_split_shapes), dim=1)
+                W_comps = torch.split(W_view, list(qkv_split_shapes), dim=1)
+                M_comps = torch.split(M_view, list(qkv_split_shapes), dim=1)
 
                 # flatten per component to 2D matrices (merging all groups)
-                comps_W = [W_q.reshape(-1, in_dim), W_k.reshape(-1, in_dim), W_v.reshape(-1, in_dim)]
-                comps_M = [M_q.reshape(-1, in_dim), M_k.reshape(-1, in_dim), M_v.reshape(-1, in_dim)]
+                comps_W = [w.reshape(-1, in_dim) for w in W_comps]
+                comps_M = [m.reshape(-1, in_dim) for m in M_comps]
 
                 updates = []
                 for idx, (Wi, Mi) in enumerate(zip(comps_W, comps_M)):
-                    ui = self._compute_component_update(Wi, Mi, tp_group, partition_dim, current_lr, param_name, component_names[idx])
+                    label = component_names[idx] if idx < len(component_names) else f"c{idx}"
+                    ui = self._compute_component_update(Wi, Mi, tp_group, partition_dim, current_lr, param_name, label)
                     # reshape back to [num_groups, part, in_dim]
-                    part_out = self.qkv_split_shapes[idx]
+                    part_out = qkv_split_shapes[idx]
                     updates.append(ui.view(num_groups, part_out, in_dim))
 
                 # stitch back into fused shape
-                U_q, U_k, U_v = updates
-                update = torch.cat([U_q, U_k, U_v], dim=1).reshape(out_dim, in_dim)
+                update = torch.cat(updates, dim=1).reshape(out_dim, in_dim)
                 return update
 
         # FC1 splitting path for gated linear units (SwiGLU)
         if self.split_fc1 and self.is_fc1_fn is not None and self.is_fc1_fn(p):
-            assert self.fc1_split_shapes is not None, "fc1_split_shapes must be provided when split_fc1=True"
+            # Prefer the per-param shapes tagged by the Megatron wrapper: in a latent-MoE
+            # model the dense FC1 (ffn_hidden_size) and the expert FC1s
+            # (moe_ffn_hidden_size) have different widths, so one global value cannot
+            # match both. Fall back to the ctor value for standalone use.
+            fc1_split_shapes = getattr(p, "fc1_split_shapes", None) or self.fc1_split_shapes
+            assert fc1_split_shapes is not None, "fc1_split_shapes must be provided when split_fc1=True"
             out_dim, in_dim = p.shape
-            gate_dim, up_dim = self.fc1_split_shapes
+            gate_dim, up_dim = fc1_split_shapes
             assert (
                 out_dim == gate_dim + up_dim
-            ), f"FC1 split shapes {self.fc1_split_shapes} do not match output dim {out_dim}"
+            ), f"FC1 split shapes {fc1_split_shapes} do not match output dim {out_dim}"
             param_name = getattr(p, 'param_name', None)
 
             # Split gate and up along dim=0
